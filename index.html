@@ -173,6 +173,10 @@ async function costruisci() {
       }
     }
 
+    // Televideo elenca dalla notizia più vecchia alla più recente.
+    // Inverto l'ordine, così la più recente sta in cima.
+    vociPagina.reverse();
+
     const nome = NOMI[numero] || "";
     const avviso = mancanti.length
       ? '<p class="errore">Sottopagine non caricate: ' +
