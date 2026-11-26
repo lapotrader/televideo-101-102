@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Televideo 101-102 — aggiornamento automatico</title>
+<style>
+  :root { color-scheme: light; }
+  body { margin:0; padding:24px; background:#f4f4f2; color:#111;
+         font-family: system-ui,-apple-system,Segoe UI,Roboto,sans-serif; }
+  header, main, footer { max-width:760px; margin:0 auto; }
+  h1 { font-size:20px; margin:0 0 6px; }
+  .barra { display:flex; flex-wrap:wrap; align-items:center; gap:10px;
+           font-size:13px; color:#555; margin:0 0 18px; line-height:1.5; }
+  .barra b { color:#111; font-weight:600; }
+  button { font:inherit; font-size:13px; padding:5px 12px; cursor:pointer;
+           border:1px solid #bbb; border-radius:4px; background:#fff; color:#111; }
+  button:hover { background:#eee; }
+  button[disabled] { opacity:.5; cursor:default; }
+  section { background:#fff; border:1px solid #d8d8d4; border-radius:6px;
+            padding:14px 18px; margin:0 0 18px; }
+  h2 { font-size:14px; font-weight:600; color:#555; margin:0 0 4px;
+       text-transform:uppercase; letter-spacing:.03em; }
+  ul.lista { list-style:none; margin:0; padding:0; }
+  ul.lista li { display:flex; gap:12px; padding:10px 0;
+                border-bottom:1px solid #ececea;
+                font-size:16px; line-height:1.55; }
+  ul.lista li.senza-ora { display:block; }
+  ul.lista li:last-child { border-bottom:none; }
+  .ora { font-weight:700; flex:0 0 3.4em; font-variant-numeric:tabular-nums;
+         color:#111; }
+  .testo { flex:1 1 auto; min-width:0; }
+  .errore { color:#a33; font-size:13px; margin:0 0 8px; }
+  .vuoto { color:#777; font-size:14px; margin:0; }
+  footer { font-size:12px; color:#777; line-height:1.5; margin-top:8px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Televideo — pagine 101 e 102</h1>
+  <div class="barra">
+    <span id="stato" role="status" aria-live="polite">Caricamento…</span>
+    <button id="aggiorna" type="button">Aggiorna ora</button>
+  </div>
+</header>
+<main id="contenuto"></main>
+<footer>
+  Testo fornito dal servizio Televideo di RaiNews, regione nazionale.
+  La pagina interroga il servizio ogni 5 minuti, senza programmi esterni.
+  I diritti del contenuto sono di Rai.
+</footer>
+
+<script>
+"use strict";
+
+const BASE = "https://www.rainews.it/atomatic/televideo-service/api/televideo/nazionale";
+const PAGINE = [101, 102];
+const INTERVALLO = 5 * 60 * 1000;           // 5 minuti
+const NOMI = { 100: "Indice", 101: "Ultim'ora", 102: "24 ore", 103: "Prima",
+               120: "Politica", 130: "Economia", 140: "Dall'Italia",
+               150: "Dal mondo", 160: "Culture", 200: "Sport", 300: "Borsa" };
+
+const stato = document.getElementById("stato");
+const contenuto = document.getElementById("contenuto");
+const bottone = document.getElementById("aggiorna");
+
+let ultimoOk = null;
+let prossimo = null;
+let inCorso = false;
+let testoPrecedente = null;
+
+function due(n) { return String(n).padStart(2, "0"); }
+function ora(d) { return due(d.getHours()) + ":" + due(d.getMinutes()) + ":" + due(d.getSeconds()); }
+
+function scriviStato(nota) {
+  const parti = [];
+  if (ultimoOk) parti.push("<b>" + ora(ultimoOk) + "</b>");
+  if (prossimo) {
+    const mancano = Math.max(0, Math.round((prossimo - Date.now()) / 1000));
+    parti.push("prossimo aggiornamento tra " +
+      Math.floor(mancano / 60) + ":" + due(mancano % 60));
+  }
+  if (nota) parti.push(nota);
+  stato.innerHTML = parti.join(" · ");
+}
+
+function escapeHtml(t) {
+  return t.replace(/&/g, "&amp;").replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+async function leggiJson(url) {
+  const risposta = await fetch(url + (url.includes("?") ? "&" : "?") + "t=" + Date.now(),
+                               { cache: "no-store" });
+  if (!risposta.ok) throw new Error("HTTP " + risposta.status);
+  return risposta.json();
+}
+
+async function elencoPagine() {
+  const dati = await leggiJson(BASE + "/list");
+  const pagine = (dati.instance && dati.instance.pages) || [];
+  const mappa = {};
+  for (const voce of pagine) {
+    if (voce && voce.pageNumber !== undefined) {
+      mappa[voce.pageNumber] = (voce.subPages || []).map(Number);
+    }
+  }
+  return mappa;
+}
+
+async function leggiSottopagina(pagina, sotto) {
+  const dati = await leggiJson(BASE + "/" + pagina + "/" + sotto);
+  const blocco = dati.subPage || {};
+  return (blocco.body || "").trim();
+}
+
+// Ripete una richiesta fallita: il servizio rifiuta qualche chiamata isolata.
+async function conRitentativo(azione, tentativi) {
+  let ultimo = null;
+  for (let i = 0; i < tentativi; i++) {
+    try { return await azione(); }
+    catch (e) {
+      ultimo = e;
+      if (i + 1 < tentativi) await new Promise(r => setTimeout(r, 1500));
+    }
+  }
+  throw ultimo;
+}
+
+// Scarta le righe di servizio: "RAI INFORMA a pagina", indirizzi web, righe vuote.
+function righeUtili(corpo) {
+  return corpo.split(/\r?\n/)
+    .map(r => r.trim())
+    .filter(r => r.length > 0)
+    .filter(r => !/^RAI INFORMA/i.test(r))
+    .filter(r => !/servizitelevideo/i.test(r))
+    .filter(r => !/^www\./i.test(r));
+}
+
+// Trasforma il testo della pagina in voci: orario + testo.
+function voci(corpo) {
+  const uscita = [];
+  for (const riga of righeUtili(corpo)) {
+    const trovato = riga.match(/^(\d{1,2}[.:]\d{2})\s*(.*)$/);
+    if (trovato) {
+      uscita.push({ ora: trovato[1], testo: trovato[2] });
+    } else if (uscita.length > 0) {
+      uscita[uscita.length - 1].testo += " " + riga;
+    } else {
+      uscita.push({ ora: "", testo: riga });
+    }
+  }
+  return uscita;
+}
+
+async function costruisci() {
+  const indice = await elencoPagine();
+  const sezioni = [];
+  const errori = [];
+
+  for (const numero of PAGINE) {
+    const sotto = indice[numero] || [];
+    const vociPagina = [];
+    const mancanti = [];
+
+    for (const s of sotto) {
+      try {
+        const testo = await conRitentativo(() => leggiSottopagina(numero, s), 3);
+        vociPagina.push(...voci(testo));
+      } catch (e) {
+        mancanti.push(numero + "." + (s + 1) + " (" + e.message + ")");
+        errori.push(numero + "." + (s + 1) + ": " + e.message);
+      }
+    }
+
+    const nome = NOMI[numero] || "";
+    const avviso = mancanti.length
+      ? '<p class="errore">Sottopagine non caricate: ' +
+        escapeHtml(mancanti.join(", ")) + "</p>" : "";
+    let elenco;
+    if (vociPagina.length === 0) {
+      elenco = '<p class="vuoto">Nessuna notizia disponibile.</p>';
+    } else {
+      elenco = '<ul class="lista">' + vociPagina.map(v =>
+        (v.ora
+          ? '<li><span class="ora">' + escapeHtml(v.ora) + "</span>" +
+            '<span class="testo">' + escapeHtml(v.testo) + "</span></li>"
+          : '<li class="senza-ora"><span class="testo">' +
+            escapeHtml(v.testo) + "</span></li>")
+      ).join("") + "</ul>";
+    }
+
+    sezioni.push("<section><h2>Pagina " + numero +
+                 (nome ? " — " + nome : "") + "</h2>" + avviso + elenco + "</section>");
+  }
+
+  contenuto.innerHTML = sezioni.join("");
+  return errori;
+}
+
+async function aggiorna() {
+  if (inCorso) return;
+  inCorso = true;
+  bottone.disabled = true;
+  scriviStato("aggiornamento in corso…");
+  try {
+    const errori = await costruisci();
+    ultimoOk = new Date();
+    testoPrecedente = contenuto.innerHTML;
+    prossimo = new Date(Date.now() + INTERVALLO);
+    scriviStato(errori.length ? "attenzione: " + errori[0] : "");
+  } catch (e) {
+    if (testoPrecedente) contenuto.innerHTML = testoPrecedente;
+    else contenuto.innerHTML = '<section><p class="errore">Dati non disponibili: ' +
+                               escapeHtml(e.message) + "</p></section>";
+    prossimo = new Date(Date.now() + INTERVALLO);
+    scriviStato("errore di rete: " + e.message);
+  } finally {
+    inCorso = false;
+    bottone.disabled = false;
+  }
+}
+
+bottone.addEventListener("click", aggiorna);
+setInterval(() => scriviStato(), 1000);
+setInterval(aggiorna, INTERVALLO);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && prossimo && Date.now() >= prossimo.getTime()) aggiorna();
+});
+aggiorna();
+</script>
+<noscript><p>Questa pagina richiede JavaScript per aggiornarsi da sola.</p></noscript>
+</body>
+</html>
